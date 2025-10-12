@@ -1,12 +1,14 @@
+// client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
+#include <stdbool.h>
 #include "raylib.h"
 
-#define SERVER_IP "10.2.139.58" // Change to your server IP
+#define SERVER_IP "192.168.53.5" // Change to your server IP
 #define PORT 12345
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 10
@@ -55,6 +57,14 @@ typedef struct {
 } TextMetrics;
 
 // =================================================================================
+// Helper function prototypes for cursor adjustments
+// =================================================================================
+void adjust_cursors_on_insert(int pos, int excludeColor);
+void adjust_cursors_on_insert_n(int pos, int n, int excludeColor);
+void adjust_cursors_on_delete(int pos, int excludeColor);
+void adjust_cursors_on_delete_range(int minIdx, int maxIdx, int excludeColor);
+
+// =================================================================================
 // Helper function to calculate the x/y position, row/col, and total metrics for an index
 // =================================================================================
 TextMetrics getTextMetrics(int targetIndex, const char* text) {
@@ -62,12 +72,14 @@ TextMetrics getTextMetrics(int targetIndex, const char* text) {
     int currentX = TEXT_START_X;
     int currentY = TEXT_START_Y;
     int currentLineWidth = 0;
+    metrics.lineCount = 0;
 
-    for (int i = 0; i < strlen(text); i++) {
+    int len = strlen(text);
+    for (int i = 0; i < len; i++) {
         if (i == targetIndex) {
             metrics.x = currentX;
             metrics.y = currentY;
-            metrics.row = metrics.lineCount - 1;
+            metrics.row = metrics.lineCount;
             metrics.col = currentX > TEXT_START_X ? (currentX - TEXT_START_X) / SPACE_WIDTH : 0; // Approximate column
         }
 
@@ -87,10 +99,10 @@ TextMetrics getTextMetrics(int targetIndex, const char* text) {
     }
 
     // Handle metrics for the index at the very end of the text
-    if (targetIndex == strlen(text)) {
+    if (targetIndex == len) {
         metrics.x = currentX;
         metrics.y = currentY;
-        metrics.row = metrics.lineCount - 1;
+        metrics.row = metrics.lineCount;
         metrics.col = currentX > TEXT_START_X ? (currentX - TEXT_START_X) / SPACE_WIDTH : 0;
     }
     
@@ -98,17 +110,16 @@ TextMetrics getTextMetrics(int targetIndex, const char* text) {
     metrics.maxLineWidth = currentLineWidth > metrics.maxLineWidth ? currentLineWidth : metrics.maxLineWidth;
     
     // If text is empty
-    if (strlen(text) == 0) {
+    if (len == 0) {
         metrics.lineCount = 1;
         metrics.x = TEXT_START_X;
         metrics.y = TEXT_START_Y;
     } else {
         // Increment line count for the last line if it wasn't ended by a newline
-        if (text[strlen(text) - 1] != '\n') {
+        if (text[len - 1] != '\n') {
             metrics.lineCount++;
         }
     }
-
 
     return metrics;
 }
@@ -139,11 +150,9 @@ int get_index_at_mouse_position(float mx, float my, const char* text) {
     }
 
     // If the mouse clicked below the text area, snap to the end of the text
-    // The total number of lines is lineCount from getTextMetrics
     if (line >= getTextMetrics(textLen, text).lineCount) {
         return textLen;
     }
-
 
     // 2. Determine the character index on that line based on x position
     int xOffset = TEXT_START_X;
@@ -167,7 +176,6 @@ int get_index_at_mouse_position(float mx, float my, const char* text) {
 
 // =================================================================================
 // Function to save, compile, and run the shared C code
-// (No change needed here, as it's not visual)
 // =================================================================================
 void save_compile_and_run(char str[]){
     FILE *fptr;
@@ -202,7 +210,7 @@ void save_compile_and_run(char str[]){
 
 // =================================================================================
 // Send edit or cursor update to server
-// (No change needed)
+// Format: "I|pos|ch" , "D|pos" , "C|pos"
 // =================================================================================
 void send_update(char action, int pos, char ch) {
     char buf[32];
@@ -216,8 +224,52 @@ void send_update(char action, int pos, char ch) {
 }
 
 // =================================================================================
+// Cursor adjustment helper implementations
+// excludeColor: color index to skip (normally your own color index) or -1 to adjust all
+// =================================================================================
+void adjust_cursors_on_insert(int pos, int excludeColor) {
+    for (int i = 0; i < otherCount; i++) {
+        if (otherColors[i] == excludeColor) continue;
+        if (otherCursors[i] >= pos) otherCursors[i]++;
+    }
+}
+
+void adjust_cursors_on_insert_n(int pos, int n, int excludeColor) {
+    for (int i = 0; i < otherCount; i++) {
+        if (otherColors[i] == excludeColor) continue;
+        if (otherCursors[i] >= pos) otherCursors[i] += n;
+    }
+}
+
+void adjust_cursors_on_delete(int pos, int excludeColor) {
+    for (int i = 0; i < otherCount; i++) {
+        if (otherColors[i] == excludeColor) continue;
+        if (otherCursors[i] > pos) otherCursors[i]--;
+        else if (otherCursors[i] == pos) {
+            // If a cursor exactly at deletion position, we leave it (it now points to the next char),
+            // but optionally you could clamp it to pos.
+        }
+    }
+}
+
+void adjust_cursors_on_delete_range(int minIdx, int maxIdx, int excludeColor) {
+    int len = maxIdx - minIdx;
+    if (len <= 0) return;
+    for (int i = 0; i < otherCount; i++) {
+        if (otherColors[i] == excludeColor) continue;
+        if (otherCursors[i] >= maxIdx) {
+            otherCursors[i] -= len;
+            if (otherCursors[i] < minIdx) otherCursors[i] = minIdx; // clamp
+        } else if (otherCursors[i] >= minIdx && otherCursors[i] < maxIdx) {
+            // If the cursor was inside deleted range, snap to minIdx
+            otherCursors[i] = minIdx;
+        }
+    }
+}
+
+
+// =================================================================================
 // Receiver thread
-// (No change needed)
 // =================================================================================
 void *receive_thread(void *arg) {
     char buf[BUFFER_SIZE*2];
@@ -295,6 +347,7 @@ void *receive_thread(void *arg) {
                 }
             }
         } else {
+            // If server sent a plain text update (no cursor section), just replace text
             strncpy(sharedText, buf, BUFFER_SIZE-1);
             sharedText[BUFFER_SIZE-1] = '\0';
             
@@ -313,7 +366,6 @@ void *receive_thread(void *arg) {
 
 // =================================================================================
 // Map color index to Raylib Color
-// (No change needed)
 // =================================================================================
 Color getColor(int idx){
     switch(idx%10){
@@ -333,7 +385,7 @@ Color getColor(int idx){
 
 // =================================================================================
 // Function to handle selection deletion
-// (No change needed)
+// Returns true if deletion happened.
 // =================================================================================
 bool delete_selection(int* cursor_moved, bool* edit_sent_this_frame) {
     if (selectionStart != selectionEnd) {
@@ -342,13 +394,18 @@ bool delete_selection(int* cursor_moved, bool* edit_sent_this_frame) {
         int len = maxIdx - minIdx;
         
         if (len > 0) {
+            // Remove range from sharedText
             memmove(sharedText + minIdx, sharedText + maxIdx, strlen(sharedText) - maxIdx + 1);
 
+            // Send DELETE messages for the range (server expects single deletes per character)
             for(int i = 0; i < len; i++) {
                 send_update('D', minIdx, 0); 
-                usleep(1000); // 1ms delay
+                usleep(1000); // 1ms delay to avoid overwhelming sockets
             }
             
+            // Locally adjust other clients' cursors
+            adjust_cursors_on_delete_range(minIdx, maxIdx, myColorIndex);
+
             cursorPos = minIdx;
             *edit_sent_this_frame = true;
         }
@@ -371,7 +428,7 @@ void keep_cursor_visible(int screenWidth, int screenHeight, TextMetrics cursorMe
     int textRegionW = screenWidth - TEXT_START_X - SCROLLBAR_WIDTH; // Account for v-bar
 
     // Vertical Scroll
-    int cursorYRel = cursorMetrics.y - scrollOffsetY;
+    int cursorYRel = cursorMetrics.y - (int)scrollOffsetY;
 
     // Check if cursor is above the visible area
     if (cursorYRel < textRegionY) {
@@ -383,7 +440,7 @@ void keep_cursor_visible(int screenWidth, int screenHeight, TextMetrics cursorMe
     }
     
     // Horizontal Scroll
-    int cursorXRel = cursorMetrics.x - scrollOffsetX;
+    int cursorXRel = cursorMetrics.x - (int)scrollOffsetX;
 
     // Check if cursor is to the left of the visible area
     if (cursorXRel < textRegionX) {
@@ -399,7 +456,6 @@ void keep_cursor_visible(int screenWidth, int screenHeight, TextMetrics cursorMe
 // Main loop for input and drawing
 // =================================================================================
 int main() {
-    // ... (Initialization and Authentication code - same as original) ...
     pthread_mutex_init(&lock,NULL);
 
     sock = socket(AF_INET, SOCK_STREAM,0);
@@ -495,7 +551,8 @@ int main() {
         // Vertical Scrollbar Logic
         Rectangle vScrollRect = { (float)screenWidth - SCROLLBAR_WIDTH, (float)TEXT_START_Y, (float)SCROLLBAR_WIDTH, viewH };
         float vScrollThumbHeight = (viewH / (maxScrollY + viewH)) * viewH;
-        float vScrollThumbY = TEXT_START_Y + (scrollOffsetY / maxScrollY) * (viewH - vScrollThumbHeight);
+        if (vScrollThumbHeight < 20) vScrollThumbHeight = 20; // min thumb size
+        float vScrollThumbY = TEXT_START_Y + (maxScrollY > 0 ? (scrollOffsetY / maxScrollY) * (viewH - vScrollThumbHeight) : 0);
         Rectangle vScrollThumbRect = { vScrollRect.x, vScrollThumbY, vScrollRect.width, vScrollThumbHeight };
 
         if (maxScrollY > 0) {
@@ -517,7 +574,8 @@ int main() {
         // Horizontal Scrollbar Logic
         Rectangle hScrollRect = { (float)TEXT_START_X, screenHeight - statusBarHeight - SCROLLBAR_WIDTH, viewW, (float)SCROLLBAR_WIDTH };
         float hScrollThumbWidth = (viewW / (maxScrollX + viewW)) * viewW;
-        float hScrollThumbX = TEXT_START_X + (scrollOffsetX / maxScrollX) * (viewW - hScrollThumbWidth);
+        if (hScrollThumbWidth < 20) hScrollThumbWidth = 20;
+        float hScrollThumbX = TEXT_START_X + (maxScrollX > 0 ? (scrollOffsetX / maxScrollX) * (viewW - hScrollThumbWidth) : 0);
         Rectangle hScrollThumbRect = { hScrollThumbX, hScrollRect.y, hScrollThumbWidth, hScrollRect.height };
 
         if (maxScrollX > 0) {
@@ -577,7 +635,7 @@ int main() {
         if (scrollOffsetY < 0) scrollOffsetY = 0;
         if (scrollOffsetY > maxScrollY) scrollOffsetY = maxScrollY;
         if (scrollOffsetX < 0) scrollOffsetX = 0;
-        if (scrollOffsetX > maxScrollX) maxScrollX = maxScrollX;
+        if (scrollOffsetX > maxScrollX) scrollOffsetX = maxScrollX;
 
         // If a scrollbar is active, skip regular text mouse input
         bool interactingWithScrollbars = draggingVScroll || draggingHScroll || CheckCollisionPointRec(mp, vScrollRect) || CheckCollisionPointRec(mp, hScrollRect);
@@ -621,15 +679,20 @@ int main() {
             delete_selection(&cursor_moved, &edit_sent_this_frame);
         }
 
-        // --- Character input (Same logic)
-        // ... (Character, Backspace, Delete, Tab, Enter logic - same as original) ...
+        // --- Character input (Same logic, but with cursor adjustments) ---
         int key = GetCharPressed();
         while(key>0){
             if(key>=32 && key<=125 && strlen(sharedText) < BUFFER_SIZE - 1){
+                int insertPos = cursorPos;
                 for(int i=strlen(sharedText);i>=cursorPos;i--) sharedText[i+1]=sharedText[i];
                 sharedText[cursorPos]=(char)key;
                 
-                send_update('I',cursorPos,(char)key);
+                // Send the insert to server
+                send_update('I',insertPos,(char)key);
+                
+                // Locally adjust other cursors (exclude our color)
+                adjust_cursors_on_insert(insertPos, myColorIndex);
+                
                 cursorPos++;
                 selectionStart = cursorPos; 
                 selectionEnd = cursorPos;
@@ -641,10 +704,16 @@ int main() {
         }
         
         if(IsKeyPressed(KEY_BACKSPACE) && cursorPos>0 && selectionStart == selectionEnd && !edit_sent_this_frame){
+            // We are deleting character at cursorPos-1
+            int delPos = cursorPos-1;
             for(int i=cursorPos-1;i<strlen(sharedText);i++) sharedText[i]=sharedText[i+1];
             
             cursorPos--;
-            send_update('D',cursorPos,0);
+            send_update('D',delPos,0);
+            
+            // Adjust other cursors locally
+            adjust_cursors_on_delete(delPos, myColorIndex);
+            
             selectionStart = cursorPos;
             selectionEnd = cursorPos;
             cursor_moved = 1; 
@@ -653,9 +722,13 @@ int main() {
         }
         
         if(IsKeyPressed(KEY_DELETE) && cursorPos < strlen(sharedText) && selectionStart == selectionEnd && !edit_sent_this_frame){
+            int delPos = cursorPos;
             for(int i=cursorPos; i<strlen(sharedText); i++) sharedText[i] = sharedText[i+1];
             
-            send_update('D', cursorPos, 0); 
+            send_update('D',delPos,0); 
+            
+            // Adjust other cursors locally
+            adjust_cursors_on_delete(delPos, myColorIndex);
             
             selectionStart = cursorPos;
             selectionEnd = cursorPos;
@@ -666,12 +739,16 @@ int main() {
         
         int tab_size = 4;
         if(IsKeyPressed(KEY_TAB) && (strlen(sharedText) + tab_size) < BUFFER_SIZE - 1){
+            int insertPos = cursorPos;
             for(int k=0; k<tab_size; k++){
                 for(int i=strlen(sharedText); i>=cursorPos; i--) sharedText[i+1] = sharedText[i];
                 sharedText[cursorPos] = ' ';
                 send_update('I', cursorPos, ' '); 
-                cursorPos++; 
+                cursorPos++;
             }
+            // Adjust other cursors by tab_size
+            adjust_cursors_on_insert_n(insertPos, tab_size, myColorIndex);
+
             selectionStart = cursorPos;
             selectionEnd = cursorPos;
             cursor_moved = 1; 
@@ -680,10 +757,12 @@ int main() {
         }
 
         if(IsKeyPressed(KEY_ENTER) && strlen(sharedText) < BUFFER_SIZE - 1){
+            int insertPos = cursorPos;
             for(int i=strlen(sharedText);i>=cursorPos;i--) sharedText[i+1]=sharedText[i];
             sharedText[cursorPos]='\n';
             
-            send_update('I',cursorPos,'\n');
+            send_update('I',insertPos,'\n');
+            adjust_cursors_on_insert(insertPos, myColorIndex);
             cursorPos++;
             selectionStart = cursorPos;
             selectionEnd = cursorPos;
